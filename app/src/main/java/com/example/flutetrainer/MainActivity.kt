@@ -29,20 +29,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import be.tarsos.dsp.pitch.Yin
 import com.example.flutetrainer.ui.theme.FluteTrainerTheme
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import kotlin.math.sqrt
 import com.google.accompanist.permissions.rememberPermissionState
+import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -160,8 +163,8 @@ fun QuizScreen() {
     var frequency by remember { mutableStateOf(0f) }
 
     DisposableEffect(Unit) {
-        // Pass the context to the AudioAnalyzer.
-        val analyzer = AudioAnalyzer(context) { freq ->
+        val analyzer = AudioAnalyzer(context)
+        { freq ->
             frequency = freq
         }
         analyzer.start()
@@ -184,11 +187,12 @@ fun QuizScreen() {
                 text = if (frequency > 0f)
                     "Detected frequency: ${"%.2f".format(frequency)} Hz"
                 else
-                    "Listening… (no frequency detected)"
+                    "Listening… (no frequency detected)${"%.2f".format(frequency)} Hz"
             )
         }
     }
 }
+
 
 class AudioAnalyzer(
     private val context: Context,
@@ -198,6 +202,9 @@ class AudioAnalyzer(
     private var audioRecord: AudioRecord? = null
     @Volatile private var isRecording = false
 
+    // Minimum volume (RMS) threshold.
+    private val minVolumeThreshold = 400
+
     fun start() {
         // Check for RECORD_AUDIO permission.
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
@@ -206,6 +213,7 @@ class AudioAnalyzer(
             Log.e("AudioAnalyzer", "RECORD_AUDIO permission not granted")
             return
         }
+
         val bufferSize = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -219,18 +227,86 @@ class AudioAnalyzer(
             bufferSize
         )
 
+        // Check that AudioRecord is properly initialized.
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e("AudioAnalyzer", "AudioRecord initialization failed")
+            return
+        }
 
         audioRecord?.startRecording()
         isRecording = true
 
         Thread {
             val buffer = ShortArray(bufferSize)
+            // Variables for consistency checking.
+            var stableFrequency = 0f
+            var stableCount = 0
+            val requiredStableCount = 2   // Require 3 consistent readings.
+            val tolerance = 2.0f           // Allowed Hz difference between readings.
+
+            // Reset delay (in milliseconds) for clearing the frequency if nothing changes.
+            val resetDelay = 2000L // 2 seconds.
+            var lastDetectionTime = System.currentTimeMillis()
+
             while (isRecording) {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                 if (read > 0) {
-                    val frequency = detectPitch(buffer, read, sampleRate)
-                    // Report the frequency on the main thread if needed.
-                    onFrequencyDetected(frequency)
+                    // Compute RMS for volume check.
+                    var sumSquares = 0.0
+                    for (i in 0 until read) {
+                        sumSquares += (buffer[i] * buffer[i]).toDouble()
+                    }
+                    val rms = sqrt(sumSquares / read)
+
+                    // Only process if the volume is high enough.
+                    if (rms < minVolumeThreshold) {
+                        // If we've been quiet for longer than the resetDelay, reset.
+                        if (System.currentTimeMillis() - lastDetectionTime > resetDelay) {
+                            if (stableFrequency != 0f) {
+                                stableFrequency = 0f
+                                stableCount = 0
+                                onFrequencyDetected(0f)
+                                lastDetectionTime = System.currentTimeMillis()
+                            }
+                        }
+                        continue
+                    }
+
+                    // Detect the frequency from the current buffer.
+                    val freq = detectPitch(buffer, read, sampleRate)
+                    if (freq == 0f || freq > 2500f) {
+                        stableCount = 0
+                        continue
+                    }
+
+                    // Update stability: if the new frequency is close enough, increase the counter.
+                    if (stableFrequency == 0f) {
+                        stableFrequency = freq
+                        stableCount = 1
+                    } else if (abs(freq - stableFrequency) <= tolerance) {
+                        stableCount++
+                        stableFrequency = (stableFrequency * (stableCount - 1) + freq) / stableCount
+                    } else {
+                        // Reset if the new reading is too far off.
+                        stableFrequency = freq
+                        stableCount = 1
+                    }
+
+                    // Once we've reached a stable reading, report it and update the detection time.
+                    if (stableCount >= requiredStableCount) {
+                        onFrequencyDetected(stableFrequency)
+                        lastDetectionTime = System.currentTimeMillis()
+                    }
+                }
+
+                // Outside of reading a new buffer, check if too much time has passed without updates.
+                if (System.currentTimeMillis() - lastDetectionTime > resetDelay) {
+                    if (stableFrequency != 0f) {
+                        stableFrequency = 0f
+                        stableCount = 0
+                        lastDetectionTime = System.currentTimeMillis()
+                        onFrequencyDetected(0f)
+                    }
                 }
             }
         }.start()
@@ -245,46 +321,38 @@ class AudioAnalyzer(
 
     /**
      * A simple autocorrelation-based pitch detection.
+     *
      * @param buffer Audio sample buffer.
      * @param read   Number of samples read.
      * @param sampleRate The audio sample rate.
      * @return Detected frequency in Hertz, or 0 if no pitch is detected.
      */
     private fun detectPitch(buffer: ShortArray, read: Int, sampleRate: Int): Float {
-        // Compute RMS to check for sufficient signal
+        // First, perform a quick RMS check to see if volume is high enough:
         var sumSquares = 0.0
         for (i in 0 until read) {
-            sumSquares += (buffer[i] * buffer[i]).toDouble()
+            sumSquares += buffer[i] * buffer[i]
         }
         val rms = sqrt(sumSquares / read)
-        if (rms < 10) { // low amplitude: consider it silence
+        if (rms < minVolumeThreshold) {
+            // If volume is below threshold, return 0.
             return 0f
         }
 
-        var bestOffset = 0
-        var bestCorrelation = 0.0
-        var lastCorrelation = 1.0
-        var foundGoodCorrelation = false
-
-        // Loop over possible offsets (lags)
-        for (offset in 1 until read) {
-            var correlation = 0.0
-            for (i in 0 until read - offset) {
-                correlation += kotlin.math.abs(buffer[i].toDouble() - buffer[i + offset].toDouble())
-            }
-            // Normalize: 0 means perfect correlation
-            correlation = 1 - (correlation / (read - offset)) / 32768.0
-
-            if (correlation > 0.9 && correlation > lastCorrelation) {
-                foundGoodCorrelation = true
-                bestCorrelation = correlation
-                bestOffset = offset
-            } else if (foundGoodCorrelation) {
-                // Assume the first drop after the peak is our best estimate.
-                break
-            }
-            lastCorrelation = correlation
+        // Convert from ShortArray (-32768..32767) to FloatArray (-1..1).
+        val floatBuffer = FloatArray(read)
+        for (i in 0 until read) {
+            floatBuffer[i] = buffer[i] / 32768f
         }
-        return if (bestOffset != 0) sampleRate.toFloat() / bestOffset.toFloat() else 0f
+
+        // Create a YIN detector with TarsosDSP
+        // The second parameter is typically the size of the buffer or 'frame size'.
+        val yin = Yin(sampleRate.toFloat(), read)
+
+        // Run pitch detection
+        val result = yin.getPitch(floatBuffer)
+
+        // If Tarsos says there's a pitched result, return it. Otherwise return 0.
+        return if (result.isPitched) result.pitch else 0f
     }
 }
